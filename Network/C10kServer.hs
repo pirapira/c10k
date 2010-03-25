@@ -35,6 +35,7 @@ import System.Posix.Process
 import System.Posix.Signals
 import System.Posix.User
 import System.Exit
+import System.Event
 
 ----------------------------------------------------------------
 
@@ -104,7 +105,7 @@ runC10kServerH srv cnf = runC10kServer' (dispatchH srv) cnf
 
 ----------------------------------------------------------------
 
-runC10kServer' :: (Socket -> Dispatch) -> C10kConfig -> IO ()
+runC10kServer' :: (Socket -> IOCallback) -> C10kConfig -> IO ()
 runC10kServer' sDispatch cnf = do
     initHook cnf `catch` ignore
     initServer sDispatch cnf `catch` errorHandle
@@ -121,14 +122,14 @@ runC10kServer' sDispatch cnf = do
 
 ----------------------------------------------------------------
 
-initServer :: (Socket -> Dispatch) -> C10kConfig -> IO ()
+initServer :: (Socket -> IOCallback) -> C10kConfig -> IO ()
 initServer sDispatch cnf = do
     let port = Service $ portName cnf
         n    = preforkProcessNumber cnf
         pidf = pidFile cnf
     s <- listenOn port
     setGroupUser
-    preFork n (sDispatch s) cnf
+    preFork n s (sDispatch s) cnf
     sClose s
     writePidFile pidf
   where
@@ -141,11 +142,11 @@ initServer sDispatch cnf = do
         getGroupEntryForName (group cnf) >>= setGroupID . groupID
         getUserEntryForName (user cnf) >>= setUserID . userID
 
-preFork :: Int -> Dispatch -> C10kConfig -> IO ()
-preFork n dispatch cnf = do
+preFork :: Int -> Socket -> IOCallback -> C10kConfig -> IO ()
+preFork n s dispatch cnf = do
     ignoreSigChild
     pid <- getProcessID
-    cids <- replicateM n $ forkProcess (runServer dispatch cnf)
+    cids <- replicateM n $ forkProcess (runServer s dispatch cnf)
     mapM_ (terminator pid cids) [sigTERM,sigINT]
   where
     ignoreSigChild = installHandler sigCHLD Ignore Nothing
@@ -157,41 +158,26 @@ preFork n dispatch cnf = do
 
 ----------------------------------------------------------------
 
-runServer :: Dispatch -> C10kConfig -> IO ()
-runServer dispatch cnf = do
+runServer :: Socket -> IOCallback -> C10kConfig -> IO ()
+runServer sock dispatch cnf = do
     startedHook cnf
-    mvar <- newMVar 0
-    dispatchOrSleep mvar dispatch cnf
-
-dispatchOrSleep :: MVar Int -> Dispatch -> C10kConfig -> IO ()
-dispatchOrSleep mvar dispatch cnf = do
-    n <- howMany
-    if n > threadNumberPerProcess cnf
-        then sleep (sleepTimer cnf * microseconds)
-        else dispatch increase decrease
-    dispatchOrSleep mvar dispatch cnf
-  where
-    howMany = readMVar mvar
-    increase = modifyMVar_ mvar (return . succ)
-    decrease = modifyMVar_ mvar (return . pred)
-    sleep = threadDelay
+    let fd = fromIntegral (fdSocket sock)
+    mgr <- new
+    registerFd mgr dispatch fd evtRead
+    loop mgr
 
 ----------------------------------------------------------------
 
-type Dispatch = IO () -> IO () -> IO ()
-
-dispatchS :: C10kServer -> Socket -> Dispatch
-dispatchS srv sock inc dec = do
+dispatchS :: C10kServer -> Socket -> IOCallback
+dispatchS srv sock _ _ = do
     (connsock,_) <- accept sock
-    inc
-    forkIO $ srv connsock `finally` (dec >> sClose connsock)
+    srv connsock `finally` sClose connsock
     return ()
 
-dispatchH :: C10kServerH -> Socket -> Dispatch
-dispatchH srv sock inc dec = do
+dispatchH :: C10kServerH -> Socket -> IOCallback
+dispatchH srv sock _ _ = do
     (hdl,tcpi) <- T.accept sock
-    inc
-    forkIO $ srv hdl tcpi `finally` (dec >> hClose hdl)
+    srv hdl tcpi `finally` hClose hdl
     return ()
 
 ----------------------------------------------------------------
