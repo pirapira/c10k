@@ -154,7 +154,7 @@ preFork n s dispatch cnf = do
     terminate pid cids = do
         mapM_ terminateChild cids
         signalProcess killProcess pid
-    terminateChild cid =  signalProcess sigTERM cid `catch` ignore
+    terminateChild cid = signalProcess sigTERM cid `catch` ignore
 
 ----------------------------------------------------------------
 
